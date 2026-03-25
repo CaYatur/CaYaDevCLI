@@ -225,3 +225,7 @@ test/
 - Delete actions require approval every time.
 - The workspace is treated as the current working directory where the CLI starts.
 - Provider settings are stored locally in `.cayadev/config.json`, which is ignored by git.
+
+## Preview
+
+![CaYaDevCLI](./CaYaDevCLI.png)
