@@ -1,0 +1,34 @@
+{
+  "name": "cayadev-cli",
+  "version": "0.1.0",
+  "description": "A simple open-source AI coding CLI with mode-based tool access and per-message checkpoints.",
+  "type": "module",
+  "bin": {
+    "caya": "./src/index.js"
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "build:exe": "node scripts/build-exe.js",
+    "start": "node src/index.js",
+    "test": "node test/parser.test.js && node test/tools.test.js && node test/prompts.test.js && node test/provider.test.js && node test/checkpoints.test.js && node test/config.test.js"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "coding-agent",
+    "open-source",
+    "cayadev"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "esbuild": "^0.27.4",
+    "png-to-ico": "^3.0.1",
+    "postject": "^1.0.0-alpha.6",
+    "rcedit": "^5.0.2",
+    "resedit": "^3.0.2"
+  }
+}
