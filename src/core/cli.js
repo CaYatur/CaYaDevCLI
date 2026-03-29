@@ -17,7 +17,7 @@ import {
 import { getModeConfig, listAllowedTools, MODE_NAMES } from "./modes.js";
 import { extractClarificationPrompt, parseAssistantEnvelope } from "./parser.js";
 import { buildSystemPrompt } from "./prompts.js";
-import { listAvailableModels, generateAssistantMessage } from "./provider.js";
+import { listAvailableModels, generateAssistantMessage, shutdownProviderModels } from "./provider.js";
 import { getProviderDefinition, isProviderId, listProviders } from "./providers.js";
 import { getReasoningConfig, isReasoningName, REASONING_NAMES } from "./reasoning.js";
 import {
@@ -45,15 +45,28 @@ const COMMANDS = [
   "/provider current",
   "/model",
   "/thinking",
+  "/keep-alive",
   "/settings",
   "/checkpoint",
   "/checkpoints",
   "/menu",
   "/tools",
   "/session",
+  "/session list",
+  "/session load",
+  "/load-session",
   "/config",
   "/exit"
 ];
+
+const TERMINAL_INPUT_ENHANCEMENTS = {
+  csiUEnable: "\u001b[>1u",
+  csiUDisable: "\u001b[<u",
+  modifyOtherKeysEnable: "\u001b[>4;2m",
+  modifyOtherKeysDisable: "\u001b[>4;0m",
+  bracketedPasteEnable: "\u001b[?2004h",
+  bracketedPasteDisable: "\u001b[?2004l"
+};
 
 export async function startCli() {
   const cwd = process.cwd();
@@ -67,6 +80,7 @@ export async function startCli() {
     ...config,
     appConfigPath: appConfig.configPath,
     history: sessionState.history,
+    composerRecallHistory: [],
     checkpointIndex: sessionState.checkpointIndex,
     readline: null,
     activeInputCleanup: null,
@@ -135,6 +149,8 @@ export async function startCli() {
         continue;
       }
 
+      rememberSubmittedComposerEntry(state, line);
+
       if (inputText.startsWith("/")) {
         const shouldExit = await handleCommand(inputText, state, rl);
 
@@ -157,12 +173,46 @@ export async function startCli() {
   } finally {
     process.off("SIGINT", sigintHandler);
     rl.off("SIGINT", sigintHandler);
+
+    await releaseProviderResources(state);
+
     try {
       input.pause();
     } catch {
       // Ignore stdin teardown errors while exiting.
     }
     rl.close();
+  }
+}
+
+async function releaseProviderResources(state) {
+  try {
+    const summary = await shutdownProviderModels({
+      providerProtocol: state.providerProtocol,
+      apiKey: state.apiKey,
+      baseUrl: state.baseUrl,
+      model: state.model
+    });
+
+    if (!summary || summary.attemptedCount === 0) {
+      return;
+    }
+
+    if (summary.failedCount === 0) {
+      console.log(renderInfoLine("provider", `Stopped ${summary.stoppedCount}/${summary.attemptedCount} Ollama model(s) on exit.`, "gray"));
+      return;
+    }
+
+    console.log(
+      renderInfoLine(
+        "warning",
+        `Stopped ${summary.stoppedCount}/${summary.attemptedCount} Ollama model(s). Failed: ${summary.failedCount}.`,
+        "yellow"
+      )
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(renderInfoLine("warning", `Failed to release provider resources: ${message}`, "yellow"));
   }
 }
 
@@ -218,6 +268,7 @@ async function handleTurn(userMessage, state, rl) {
           model: state.model,
           messages,
           temperature: state.mode.temperature,
+          keepAlive: state.keepAlive,
           signal: state.activeTurnController.signal
         });
       } catch (error) {
@@ -532,6 +583,10 @@ async function handleCommand(inputText, state, rl) {
     case "reasoning":
       await handleThinkingCommand(rest, state);
       return false;
+    case "keep-alive":
+    case "keepalive":
+      await handleKeepAliveCommand(rest, state);
+      return false;
     case "settings":
       await openSettingsMenu(state, rl);
       return false;
@@ -552,8 +607,19 @@ async function handleCommand(inputText, state, rl) {
       await openQuickMenu(state, rl);
       return false;
     case "session":
-      console.log(renderInfoLine("session", state.sessionId));
-      console.log(renderInfoLine("directory", state.sessionDir, "gray"));
+    case "season":
+      await handleSessionCommand(rest, state, rl);
+      return false;
+    case "load-session":
+    case "load-season":
+      await handleSessionCommand(["load", ...rest], state, rl);
+      return false;
+    case "load":
+      if ((rest[0] === "session" || rest[0] === "season") && rest[1]) {
+        await handleSessionCommand(["load", ...rest.slice(1)], state, rl);
+        return false;
+      }
+      console.log(renderInfoLine("error", "Usage: /load session <id>", "red"));
       return false;
     case "config":
       console.log(renderSectionTitle("Config"));
@@ -566,7 +632,9 @@ async function handleCommand(inputText, state, rl) {
             protocol: state.providerProtocol,
             model: state.model,
             baseUrl: state.baseUrl,
+            keepAlive: state.keepAlive || "24h",
             sessionId: state.sessionId,
+            sessionDir: state.sessionDir,
             maxSteps: state.maxSteps
           },
           null,
@@ -644,6 +712,206 @@ async function handleThinkingCommand(args, state) {
   console.log(renderInfoLine("thinking", `changed to ${state.reasoning.label}`, "green"));
 }
 
+async function handleKeepAliveCommand(args, state) {
+  const nextKeepAlive = String(args[0] ?? "").trim();
+
+  if (!nextKeepAlive) {
+    console.log(renderInfoLine("keep-alive", state.keepAlive, "cyan"));
+    console.log(renderInfoLine("examples", "10m, 1h, 6h, 24h, 48h", "gray"));
+    console.log(renderInfoLine("note", "Prevents model timeouts during slow/long responses", "gray"));
+    return;
+  }
+
+  state.keepAlive = nextKeepAlive;
+  await persistAppConfig(state);
+  console.log(renderInfoLine("keep-alive", `changed to ${nextKeepAlive}`, "green"));
+}
+
+async function handleSessionCommand(args, state, _rl) {
+  const action = String(args[0] ?? "").toLowerCase();
+
+  if (!action || action === "current") {
+    console.log(renderInfoLine("session", state.sessionId));
+    console.log(renderInfoLine("directory", state.sessionDir, "gray"));
+    const sessions = await listSavedSessions(state.cwd);
+    console.log(renderInfoLine("saved", String(sessions.length), "gray"));
+    await printSavedSessions(state, sessions);
+    return;
+  }
+
+  if (action === "list" || action === "ls") {
+    await printSavedSessions(state);
+    return;
+  }
+
+  if (action === "load" || action === "open") {
+    const requestedId = String(args.slice(1).join(" ")).trim();
+
+    if (requestedId) {
+      await loadSavedSessionById(requestedId, state);
+      return;
+    }
+
+    const sessions = await listSavedSessions(state.cwd);
+
+    if (sessions.length === 0) {
+      console.log(renderInfoLine("sessions", "No saved sessions found.", "gray"));
+      return;
+    }
+
+    const items = sessions.map((entry) => ({
+      id: entry.id,
+      label: entry.id,
+      description: `${entry.modeName || "unknown"} | ${entry.providerId || "unknown"} | ${truncate(entry.model || "(not set)", 28)} | turns ${entry.userTurns}`
+    }));
+    const selected = await chooseFromMenu("Load Session", items, state, {
+      intro: "Select a saved session to continue."
+    });
+
+    if (!selected?.id) {
+      console.log(renderInfoLine("session", "load cancelled", "gray"));
+      return;
+    }
+
+    await loadSavedSessionById(selected.id, state);
+    return;
+  }
+
+  console.log(renderInfoLine("error", "Usage: /session [list|load <id>]", "red"));
+}
+
+async function listSavedSessions(cwd) {
+  const sessionsRoot = path.join(cwd, ".cayadev", "sessions");
+
+  if (!(await pathExists(sessionsRoot))) {
+    return [];
+  }
+
+  let entries = [];
+
+  try {
+    entries = await fs.readdir(sessionsRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const directories = entries.filter((entry) => entry.isDirectory());
+  const sessions = await Promise.all(
+    directories.map(async (entry) => {
+      const sessionDir = path.join(sessionsRoot, entry.name);
+      const sessionFile = path.join(sessionDir, "session.json");
+
+      if (!(await pathExists(sessionFile))) {
+        return null;
+      }
+
+      try {
+        const content = await fs.readFile(sessionFile, "utf8");
+        const parsed = JSON.parse(content);
+        const stats = await fs.stat(sessionFile).catch(() => null);
+        const history = Array.isArray(parsed.history) ? parsed.history : [];
+        const userTurns = history.filter((record) => record?.role === "user").length;
+
+        return {
+          id: String(parsed.sessionId ?? entry.name),
+          sessionDir,
+          modeName: String(parsed.modeName ?? ""),
+          providerId: String(parsed.providerId ?? ""),
+          providerProtocol: String(parsed.providerProtocol ?? ""),
+          model: String(parsed.model ?? ""),
+          baseUrl: String(parsed.baseUrl ?? ""),
+          checkpointIndex: Number.isFinite(parsed.checkpointIndex) ? parsed.checkpointIndex : 0,
+          userTurns,
+          updatedAtMs: Number(stats?.mtimeMs ?? 0)
+        };
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  return sessions
+    .filter(Boolean)
+    .sort((left, right) => right.updatedAtMs - left.updatedAtMs);
+}
+
+async function printSavedSessions(state, providedSessions = null) {
+  const sessions = Array.isArray(providedSessions)
+    ? providedSessions
+    : await listSavedSessions(state.cwd);
+
+  if (sessions.length === 0) {
+    console.log(renderInfoLine("sessions", "No saved sessions found.", "gray"));
+    return;
+  }
+
+  console.log(renderSectionTitle("Saved Sessions"));
+  sessions.forEach((entry, index) => {
+    const marker = entry.id === state.sessionId ? "*" : " ";
+    const updatedAt = entry.updatedAtMs > 0 ? new Date(entry.updatedAtMs).toISOString() : "unknown";
+
+    console.log(`${marker} ${index + 1}. ${entry.id}`);
+    console.log(`   ${entry.modeName || "unknown"} | ${entry.providerId || "unknown"} | ${truncate(entry.model || "(not set)", 28)} | turns ${entry.userTurns} | checkpoints ${entry.checkpointIndex} | ${updatedAt}`);
+  });
+  console.log(renderInfoLine("hint", "Use /session load <session-id> to continue a previous chat.", "gray"));
+}
+
+async function loadSavedSessionById(sessionId, state) {
+  const requestedId = String(sessionId ?? "").trim();
+
+  if (!requestedId) {
+    console.log(renderInfoLine("error", "Session id is required. Usage: /session load <id>", "red"));
+    return;
+  }
+
+  const sessions = await listSavedSessions(state.cwd);
+  const selected = sessions.find((entry) => entry.id === requestedId);
+
+  if (!selected) {
+    console.log(renderInfoLine("error", `Session not found: ${requestedId}`, "red"));
+    await printSavedSessions(state, sessions);
+    return;
+  }
+
+  const loaded = await loadSessionState(selected.sessionDir);
+  state.sessionId = selected.id;
+  state.sessionDir = selected.sessionDir;
+  state.history = loaded.history;
+  state.checkpointIndex = loaded.checkpointIndex;
+
+  if (selected.modeName && MODE_NAMES.includes(selected.modeName)) {
+    state.modeName = selected.modeName;
+    state.mode = getModeConfig(selected.modeName);
+  }
+
+  if (selected.providerId && isProviderId(selected.providerId)) {
+    const provider = getProviderDefinition(selected.providerId);
+    state.providerId = selected.providerId;
+    state.providerLabel = provider.label;
+  }
+
+  if (selected.providerProtocol) {
+    state.providerProtocol = selected.providerProtocol;
+  }
+
+  if (selected.baseUrl) {
+    state.baseUrl = selected.baseUrl;
+  }
+
+  if (selected.model) {
+    state.model = selected.model;
+  }
+
+  state.composerRecallHistory = [];
+  await persistAppConfig(state);
+
+  const turnCount = state.history.filter((entry) => entry?.role === "user").length;
+  console.log(renderInfoLine("session", `loaded ${state.sessionId}`, "green"));
+  console.log(renderInfoLine("turns", String(turnCount), "gray"));
+  console.log(renderInfoLine("mode", state.modeName, "gray"));
+  console.log(renderInfoLine("model", state.model || "(not set)", "gray"));
+}
+
 async function handleProviderCommand(args, state, rl) {
   if (args[0] === "current") {
     console.log(renderInfoLine("provider", state.providerLabel));
@@ -710,7 +978,13 @@ function printTools(state) {
 }
 
 function printHelp() {
+  const preferredNewlineShortcut = getPreferredNewlineShortcutLabel();
+
   console.log(renderSectionTitle("Commands"));
+  console.log("Enter               Send the composed message");
+  console.log(`New line            ${preferredNewlineShortcut}`);
+  console.log("Ctrl+L              Add a new line fallback (works in all terminals)");
+  console.log("Windows tip         If Shift+Enter fails, map it to ESC[13;2u in terminal settings");
   console.log("/help               Show this help");
   console.log("/mode               Show current mode");
   console.log("/mode <name>        Switch to advanced, medium, normal, or low");
@@ -720,16 +994,21 @@ function printHelp() {
   console.log("/model <name>       Switch model directly");
   console.log("/thinking           Show current thinking level");
   console.log("/thinking <level>   Set low, medium, high, or extra_high");
+  console.log("/keep-alive         Show current model keep-alive duration");
+  console.log("/keep-alive <time>  Set keep-alive (e.g., 10m, 1h, 24h, 48h)");
   console.log("/settings           Open the runtime settings menu");
   console.log("/checkpoint         Open checkpoint restore menu");
   console.log("/checkpoint <id>    Restore a specific checkpoint");
   console.log("/checkpoints        List current session checkpoints");
   console.log("/menu               Open quick action menu");
   console.log("/tools              Show tools allowed in the current mode");
-  console.log("/session            Show session information");
+  console.log("/session            Show current session and saved session list");
+  console.log("/session list       List saved sessions");
+  console.log("/session load <id>  Load a saved session and continue from it");
+  console.log("/load-session <id>  Alias for /session load <id>");
   console.log("/config             Show active runtime configuration");
   console.log("/exit               Exit the CLI");
-  console.log("Ctrl+C              Stop the current response");
+  console.log("Ctrl+C              Clear draft (or stop current response)");
   console.log("Ctrl+C twice        Exit the application");
 }
 
@@ -1025,6 +1304,11 @@ async function openSettingsMenu(state, rl) {
       action: async () => handleModelCommand([], state, rl)
     },
     {
+      label: `Keep-alive: ${state.keepAlive}`,
+      description: "Set model keep-alive duration (prevents timeout on slow responses).",
+      action: async () => await handleKeepAliveCommand([], state)
+    },
+    {
       label: "Show config",
       description: "Print the active runtime configuration.",
       action: async () => handleCommand("/config", state, rl)
@@ -1181,9 +1465,29 @@ async function restoreCheckpointById(checkpointId, state, rl) {
 }
 
 function printHome(state) {
+  const preferredNewlineShortcut = getPreferredNewlineShortcutLabel();
+
   console.log(renderBanner(state.mode, state.model, state.providerLabel, state.reasoning.label));
-  console.log(renderInfoLine("hint", "Type /help for commands. Ctrl+C stops a response, twice exits. The UI supports markdown rendering and quick menus.", "gray"));
+  console.log(
+    renderInfoLine(
+      "hint",
+      `Type /help for commands. Enter sends, ${preferredNewlineShortcut}. Ctrl+C clears draft (or stops a response).`,
+      "gray"
+    )
+  );
   console.log(renderFooter());
+}
+
+function getPreferredNewlineShortcutLabel() {
+  if (process.platform !== "win32") {
+    return "Shift+Enter adds a new line";
+  }
+
+  if (process.env.TERM_PROGRAM === "vscode" || process.env.WT_SESSION) {
+    return "Shift+Enter adds a new line (fallback: Ctrl+L)";
+  }
+
+  return "Ctrl+L adds a new line (Shift+Enter terminal-dependent)";
 }
 
 function truncate(value, maxLength) {
@@ -1723,9 +2027,11 @@ async function promptForChatInput(state, rl) {
   input.resume();
 
   const previousRawMode = input.isRaw;
+  let enhancedInputEnabled = false;
 
   if (input.isTTY) {
     input.setRawMode(true);
+    enhancedInputEnabled = enableTerminalInputEnhancements();
   }
 
   let typedText = "";
@@ -1733,13 +2039,14 @@ async function promptForChatInput(state, rl) {
   let commandSuggestions = [];
   let renderedLineCount = 0;
   let cursorIndex = 0;
-  const historyEntries = getComposerHistoryEntries(state.history);
+  const historyEntries = getComposerHistoryEntries(state.history, state.composerRecallHistory);
   let historyIndex = historyEntries.length;
   let draftEntry = null;
   let rapidInputBuffer = "";
   let rapidInputEventCount = 0;
   let rapidInputLastAt = 0;
   let rapidInputTimer = null;
+  let lastEscapeAt = 0;
 
   const render = () => {
     clearRenderedComposer(renderedLineCount);
@@ -1823,8 +2130,30 @@ async function promptForChatInput(state, rl) {
         return;
       }
 
+      const sequence = typeof str === "string" ? str : String(key.sequence ?? "");
+
+      if (key.name === "escape" && sequence === "\u001b") {
+        lastEscapeAt = Date.now();
+        return;
+      }
+
       if (key.ctrl && key.name === "c") {
         flushRapidInput({ forceTyped: true });
+
+        const draft = snapshotDraft();
+
+        if (hasComposerDraftContent(draft)) {
+          rememberComposerRecallEntry(state, historyEntries, draft);
+          typedText = "";
+          pastedText = "";
+          cursorIndex = 0;
+          historyIndex = historyEntries.length;
+          draftEntry = null;
+          commandSuggestions = [];
+          render();
+          return;
+        }
+
         handleSigint(state);
 
         if (state.exitRequested) {
@@ -1837,7 +2166,53 @@ async function promptForChatInput(state, rl) {
         return;
       }
 
-      if (key.name === "return") {
+      if (isComposerIgnoredShortcut(key, sequence)) {
+        flushRapidInput({ forceTyped: true });
+        commandSuggestions = [];
+        render();
+        return;
+      }
+
+      if (key.name === "linefeed") {
+        flushRapidInput({ forceTyped: true });
+
+        // Only consume silently if it's Ctrl+J (Ctrl+Linefeed) but not with Shift
+        if ((key.ctrl && !key.shift) || (key.meta && !key.shift)) {
+          commandSuggestions = [];
+          render();
+          return;
+        }
+
+        leaveHistoryNavigation();
+        typedText = typedText.slice(0, cursorIndex) + "\n" + typedText.slice(cursorIndex);
+        cursorIndex += 1;
+        commandSuggestions = [];
+        render();
+        return;
+      }
+
+      if (isComposerNewLineShortcut(key, sequence, lastEscapeAt)) {
+        flushRapidInput({ forceTyped: true });
+        leaveHistoryNavigation();
+        typedText = typedText.slice(0, cursorIndex) + "\n" + typedText.slice(cursorIndex);
+        cursorIndex += 1;
+        commandSuggestions = [];
+        render();
+        return;
+      }
+
+      // Ctrl+L for newline (Windows PowerShell workaround for Shift+Enter)
+      if (key.ctrl && key.name === "l") {
+        flushRapidInput({ forceTyped: true });
+        leaveHistoryNavigation();
+        typedText = typedText.slice(0, cursorIndex) + "\n" + typedText.slice(cursorIndex);
+        cursorIndex += 1;
+        commandSuggestions = [];
+        render();
+        return;
+      }
+
+      if (isComposerSendShortcut(key, sequence, lastEscapeAt)) {
         const now = Date.now();
 
         if (rapidInputBuffer && now - rapidInputLastAt <= 40) {
@@ -1978,17 +2353,16 @@ async function promptForChatInput(state, rl) {
         return;
       }
 
-      if (key.ctrl || key.meta) {
-        return;
-      }
-
-      const sequence = typeof str === "string" ? str : String(key.sequence ?? "");
-
       if (isLikelyPasteSequence(sequence, key)) {
+        flushRapidInput({ forceTyped: true });
         leaveHistoryNavigation();
         pastedText = appendPastedText(pastedText, normalizePastedText(sequence));
         commandSuggestions = [];
         render();
+        return;
+      }
+
+      if (key.ctrl || key.meta) {
         return;
       }
 
@@ -2023,6 +2397,12 @@ async function promptForChatInput(state, rl) {
       if (state.activeInputCleanup === cleanup) {
         state.activeInputCleanup = null;
       }
+
+      if (enhancedInputEnabled) {
+        disableTerminalInputEnhancements();
+        enhancedInputEnabled = false;
+      }
+
       resetRapidInput();
       input.off("keypress", onKeypress);
 
@@ -2086,30 +2466,29 @@ function countRenderedLines(text) {
 
 function positionComposerCursor(modeName, typedText, cursorIndex) {
   const width = getComposerWidth();
-  const promptLength = stripAnsi(renderUserPrompt(modeName)).length;
-  const totalLength = promptLength + String(typedText ?? "").length;
-  const cursorLength = promptLength + Math.max(0, Math.min(cursorIndex, String(typedText ?? "").length));
-  const totalRows = countWrappedVisualLines(" ".repeat(Math.max(totalLength, 1)), width);
-  const cursorRows = countWrappedVisualLines(" ".repeat(Math.max(cursorLength, 1)), width);
-  const moveUp = Math.max(0, totalRows - cursorRows);
+  const promptText = stripAnsi(renderUserPrompt(modeName));
+  const value = String(typedText ?? "");
+  const clampedCursorIndex = Math.max(0, Math.min(cursorIndex, value.length));
+  const fullMetrics = measureVisualCursor(`${promptText}${value}`, width);
+  const cursorMetrics = measureVisualCursor(`${promptText}${value.slice(0, clampedCursorIndex)}`, width);
+  const moveUp = Math.max(0, fullMetrics.row - cursorMetrics.row);
 
   if (moveUp > 0) {
     readline.moveCursor(output, 0, -moveUp);
   }
 
-  readline.cursorTo(output, cursorLength % width);
+  readline.cursorTo(output, cursorMetrics.column);
 }
 
 function buildComposedUserMessage(typedText, pastedText) {
-  const messageText = String(typedText ?? "").trim();
+  const messageText = String(typedText ?? "").replaceAll("\r\n", "\n").trimEnd();
   const pasted = String(pastedText ?? "").replaceAll("\r\n", "\n").trimEnd();
 
   if (!pasted) {
     return messageText;
   }
 
-  const pastedBlock = `Pasted text:\n\`\`\`text\n${pasted}\n\`\`\``;
-  return messageText ? `${messageText}\n\n${pastedBlock}` : pastedBlock;
+  return messageText ? `${messageText}\n${pasted}` : pasted;
 }
 
 function getCommandMatches(value) {
@@ -2131,26 +2510,39 @@ function isLikelyPasteSequence(sequence, key) {
     return false;
   }
 
+  if ((sequence === "\n" || sequence === "\r") && sequence.length === 1) {
+    return false;
+  }
+
+  if (sequence.includes("\u001b[200~") || sequence.includes("\u001b[201~")) {
+    return true;
+  }
+
   return sequence.includes("\n") || sequence.includes("\r") || sequence.length > 4;
 }
 
 function normalizePastedText(sequence) {
   return String(sequence ?? "")
+    .replaceAll("\u001b[200~", "")
+    .replaceAll("\u001b[201~", "")
     .replaceAll("\r\n", "\n")
-    .replaceAll("\r", "\n")
-    .trim();
+    .replaceAll("\r", "\n");
 }
 
 function appendPastedText(existingText, nextText) {
-  const current = String(existingText ?? "").trim();
-  const incoming = String(nextText ?? "").trim();
+  const current = String(existingText ?? "");
+  const incoming = String(nextText ?? "");
+
+  if (!incoming) {
+    return current;
+  }
 
   if (!current) {
     return incoming;
   }
 
-  if (!incoming) {
-    return current;
+  if (current.endsWith("\n") || incoming.startsWith("\n")) {
+    return `${current}${incoming}`;
   }
 
   return `${current}\n${incoming}`;
@@ -2189,6 +2581,83 @@ function shouldTreatBufferedInputAsPaste(text, eventCount) {
   );
 }
 
+function isComposerIgnoredShortcut(key, sequence) {
+  if (key?.ctrl && (key.name === "s" || key.name === "j" || key.name === "linefeed")) {
+    return true;
+  }
+
+  const value = String(sequence ?? "");
+
+  return process.platform === "win32" && key?.ctrl && value === "\n";
+}
+
+function isComposerNewLineShortcut(key, sequence, lastEscapeAt = 0) {
+  if ((key?.name === "return" || key?.name === "enter") && (key.shift || key.meta)) {
+    return true;
+  }
+
+  const value = String(sequence ?? "");
+
+  if (isShiftEnterEscapeSequence(value)) {
+    return true;
+  }
+
+  if ((key?.name === "return" || key?.name === "enter") && Date.now() - Number(lastEscapeAt ?? 0) <= 120) {
+    return true;
+  }
+
+  return false;
+}
+
+function isComposerSendShortcut(key, sequence, lastEscapeAt = 0) {
+  if (key?.name !== "return" && key?.name !== "enter") {
+    return false;
+  }
+
+  if (key.ctrl || key.shift || key.meta) {
+    return false;
+  }
+
+  const value = String(sequence ?? "");
+
+  if (Date.now() - Number(lastEscapeAt ?? 0) <= 120) {
+    return false;
+  }
+
+  if (isShiftEnterEscapeSequence(value)) {
+    return false;
+  }
+
+  if (process.platform === "win32" && value === "\n") {
+    return false;
+  }
+
+  return value === "" || value === "\r" || value === "\n";
+}
+
+function isShiftEnterEscapeSequence(sequence) {
+  const value = String(sequence ?? "");
+
+  if (!value) {
+    return false;
+  }
+
+  if (value === "\u001b\r" || value === "\u001b\n") {
+    return true;
+  }
+
+  if (value === "\u001b[13;2u" || value === "\u001b[27;2;13~") {
+    return true;
+  }
+
+  return (
+    value.startsWith("\u001b[") &&
+    value.includes("13") &&
+    value.includes(";2") &&
+    (value.endsWith("u") || value.endsWith("~"))
+  );
+}
+
 function isPrintableSequence(sequence) {
   if (!sequence) {
     return false;
@@ -2197,15 +2666,125 @@ function isPrintableSequence(sequence) {
   return !/[\u0000-\u001f\u007f]/.test(sequence);
 }
 
-function getComposerHistoryEntries(history) {
-  return history
+function getComposerHistoryEntries(history, recallHistory = []) {
+  const sentEntries = history
     .filter((entry) => entry?.role === "user")
-    .map((entry) => splitComposedUserMessage(entry.content))
-    .filter((entry) => entry.typedText || entry.pastedText);
+    .map((entry) => splitComposedUserMessage(entry.content));
+  const recalledEntries = Array.isArray(recallHistory)
+    ? recallHistory.map((entry) => ({
+        typedText: String(entry?.typedText ?? ""),
+        pastedText: String(entry?.pastedText ?? "")
+      }))
+    : [];
+
+  return dedupeComposerEntries([...sentEntries, ...recalledEntries]);
+}
+
+function dedupeComposerEntries(entries) {
+  const deduped = [];
+
+  for (const entry of entries) {
+    const normalized = {
+      typedText: String(entry?.typedText ?? ""),
+      pastedText: String(entry?.pastedText ?? "")
+    };
+
+    if (!hasComposerDraftContent(normalized)) {
+      continue;
+    }
+
+    const last = deduped[deduped.length - 1];
+
+    if (last && last.typedText === normalized.typedText && last.pastedText === normalized.pastedText) {
+      continue;
+    }
+
+    deduped.push(normalized);
+  }
+
+  return deduped;
+}
+
+function hasComposerDraftContent(entry) {
+  const typedText = String(entry?.typedText ?? "").trim();
+  const pastedText = String(entry?.pastedText ?? "").trim();
+  return Boolean(typedText || pastedText);
+}
+
+function rememberComposerRecallEntry(state, historyEntries, entry) {
+  const normalized = {
+    typedText: String(entry?.typedText ?? ""),
+    pastedText: String(entry?.pastedText ?? "")
+  };
+
+  if (!hasComposerDraftContent(normalized)) {
+    return;
+  }
+
+  if (!Array.isArray(state.composerRecallHistory)) {
+    state.composerRecallHistory = [];
+  }
+
+  const recall = state.composerRecallHistory;
+  const lastSaved = recall[recall.length - 1];
+
+  if (lastSaved && lastSaved.typedText === normalized.typedText && lastSaved.pastedText === normalized.pastedText) {
+    if (historyEntries.length === 0) {
+      historyEntries.push(normalized);
+      return;
+    }
+
+    const lastHistory = historyEntries[historyEntries.length - 1];
+
+    if (lastHistory.typedText !== normalized.typedText || lastHistory.pastedText !== normalized.pastedText) {
+      historyEntries.push(normalized);
+    }
+
+    return;
+  }
+
+  recall.push(normalized);
+
+  if (recall.length > 80) {
+    recall.shift();
+  }
+
+  historyEntries.push(normalized);
+}
+
+function rememberSubmittedComposerEntry(state, submittedText) {
+  const normalizedText = String(submittedText ?? "")
+    .replaceAll("\r\n", "\n")
+    .trimEnd();
+  const entry = splitComposedUserMessage(normalizedText);
+
+  if (!hasComposerDraftContent(entry)) {
+    return;
+  }
+
+  if (!Array.isArray(state.composerRecallHistory)) {
+    state.composerRecallHistory = [];
+  }
+
+  const normalizedEntry = {
+    typedText: String(entry.typedText ?? ""),
+    pastedText: String(entry.pastedText ?? "")
+  };
+  const lastEntry = state.composerRecallHistory[state.composerRecallHistory.length - 1];
+
+  if (lastEntry && lastEntry.typedText === normalizedEntry.typedText && lastEntry.pastedText === normalizedEntry.pastedText) {
+    return;
+  }
+
+  state.composerRecallHistory.push(normalizedEntry);
+
+  if (state.composerRecallHistory.length > 160) {
+    state.composerRecallHistory.shift();
+  }
 }
 
 function splitComposedUserMessage(content) {
-  const normalized = String(content ?? "").replaceAll("\r\n", "\n").trim();
+  const normalized = String(content ?? "").replaceAll("\r\n", "\n");
   const match = normalized.match(/^(?<typed>[\s\S]*?)(?:\n\n)?Pasted text:\n```text\n(?<pasted>[\s\S]*?)\n```$/);
 
   if (!match?.groups) {
@@ -2216,9 +2795,38 @@ function splitComposedUserMessage(content) {
   }
 
   return {
-    typedText: String(match.groups.typed ?? "").trimEnd(),
+    typedText: String(match.groups.typed ?? ""),
     pastedText: String(match.groups.pasted ?? "")
   };
+}
+
+function enableTerminalInputEnhancements() {
+  if (!output.isTTY) {
+    return false;
+  }
+
+  try {
+    output.write(TERMINAL_INPUT_ENHANCEMENTS.csiUEnable);
+    output.write(TERMINAL_INPUT_ENHANCEMENTS.modifyOtherKeysEnable);
+    output.write(TERMINAL_INPUT_ENHANCEMENTS.bracketedPasteEnable);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function disableTerminalInputEnhancements() {
+  if (!output.isTTY) {
+    return;
+  }
+
+  try {
+    output.write(TERMINAL_INPUT_ENHANCEMENTS.bracketedPasteDisable);
+    output.write(TERMINAL_INPUT_ENHANCEMENTS.modifyOtherKeysDisable);
+    output.write(TERMINAL_INPUT_ENHANCEMENTS.csiUDisable);
+  } catch {
+    // Ignore terminal teardown errors while the session is ending.
+  }
 }
 
 function stripAnsi(text) {
@@ -2233,6 +2841,30 @@ function getComposerWidth() {
 function countWrappedVisualLines(text, width) {
   const length = String(text ?? "").length;
   return Math.max(1, Math.ceil(Math.max(length, 1) / width));
+}
+
+function measureVisualCursor(text, width) {
+  const normalizedWidth = Math.max(1, Number(width ?? 80) || 80);
+  const value = String(text ?? "").replaceAll("\r\n", "\n");
+  let row = 1;
+  let column = 0;
+
+  for (const character of value) {
+    if (character === "\n") {
+      row += 1;
+      column = 0;
+      continue;
+    }
+
+    column += 1;
+
+    if (column >= normalizedWidth) {
+      row += 1;
+      column = 0;
+    }
+  }
+
+  return { row, column };
 }
 
 function createCommandCompleter() {

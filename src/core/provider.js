@@ -1,10 +1,10 @@
+// Copyright (c) 2026 CaYaDev - https://cayadev.com - Licensed under the MIT License.
+
 function buildUrl(baseUrl, suffix) {
   const normalizedBase = String(baseUrl ?? "").replace(/\/+$/, "");
   const normalizedSuffix = String(suffix ?? "").replace(/^\/+/, "");
   return `${normalizedBase}/${normalizedSuffix}`;
 }
-
-// Copyright (c) 2026 CaYaDev - https://cayadev.com - Licensed under the MIT License.
 
 export async function generateAssistantMessage({
   providerProtocol,
@@ -13,6 +13,7 @@ export async function generateAssistantMessage({
   model,
   messages,
   temperature,
+  keepAlive = "24h",
   signal
 }) {
   if (!baseUrl) {
@@ -23,7 +24,7 @@ export async function generateAssistantMessage({
     case "anthropic":
       return generateAnthropicMessage({ apiKey, baseUrl, model, messages, temperature, signal });
     case "ollama":
-      return generateOllamaMessage({ apiKey, baseUrl, model, messages, temperature, signal });
+      return generateOllamaMessage({ apiKey, baseUrl, model, messages, temperature, keepAlive, signal });
     default:
       return generateOpenAiCompatibleMessage({ apiKey, baseUrl, model, messages, temperature, signal });
   }
@@ -50,6 +51,74 @@ export async function listAvailableModels({
   } catch {
     return [];
   }
+}
+
+export async function shutdownProviderModels({
+  providerProtocol,
+  apiKey,
+  baseUrl,
+  model
+}) {
+  if (providerProtocol !== "ollama" || !baseUrl) {
+    return {
+      attemptedCount: 0,
+      stoppedCount: 0,
+      failedCount: 0,
+      errors: []
+    };
+  }
+
+  const headers = {};
+
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  const runningModels = await listRunningOllamaModels({ headers, baseUrl });
+  const fallbackModel = String(model ?? "").trim();
+  const candidateModels = runningModels.length > 0
+    ? runningModels
+    : fallbackModel
+      ? [fallbackModel]
+      : [];
+  const modelsToStop = [...new Set(candidateModels)];
+  const errors = [];
+  let stoppedCount = 0;
+
+  for (const runningModel of modelsToStop) {
+    try {
+      const response = await fetchWithTimeout(buildUrl(baseUrl, "api/generate"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...headers
+        },
+        body: JSON.stringify({
+          model: runningModel,
+          prompt: "",
+          stream: false,
+          keep_alive: 0
+        })
+      });
+
+      if (response.ok) {
+        stoppedCount += 1;
+        continue;
+      }
+
+      errors.push(`${runningModel} (${response.status})`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`${runningModel} (${message})`);
+    }
+  }
+
+  return {
+    attemptedCount: modelsToStop.length,
+    stoppedCount,
+    failedCount: errors.length,
+    errors
+  };
 }
 
 async function generateOpenAiCompatibleMessage({
@@ -146,6 +215,7 @@ async function generateOllamaMessage({
   model,
   messages,
   temperature,
+  keepAlive,
   signal
 }) {
   const headers = {
@@ -159,6 +229,7 @@ async function generateOllamaMessage({
   const chatRequest = {
     model,
     stream: false,
+    keep_alive: keepAlive,
     options: {
       temperature
     },
@@ -193,6 +264,7 @@ async function generateOllamaMessage({
     model,
     messages,
     temperature,
+    keepAlive,
     signal
   });
 }
@@ -270,6 +342,28 @@ async function listOllamaModels({ apiKey, baseUrl }) {
     : [];
 }
 
+async function listRunningOllamaModels({ headers, baseUrl }) {
+  try {
+    const response = await fetchWithTimeout(buildUrl(baseUrl, "api/ps"), {
+      headers
+    });
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const data = await response.json();
+    return Array.isArray(data?.models)
+      ? data.models
+          .map((entry) => String(entry?.name ?? entry?.model ?? "").trim())
+          .filter(Boolean)
+          .slice(0, 64)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function toAnthropicPayload(messages) {
   const systemParts = [];
   const conversation = [];
@@ -340,6 +434,7 @@ async function generateOllamaFallbackMessage({
   model,
   messages,
   temperature,
+  keepAlive,
   signal
 }) {
   const headers = {
@@ -357,6 +452,7 @@ async function generateOllamaFallbackMessage({
     body: JSON.stringify({
       model,
       stream: false,
+      keep_alive: keepAlive,
       options: {
         temperature
       },
@@ -391,4 +487,18 @@ function toOllamaGeneratePrompt(messages) {
 
 function isAbortLike(error) {
   return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
+}
+
+async function fetchWithTimeout(url, options, timeoutMs = 3500) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }

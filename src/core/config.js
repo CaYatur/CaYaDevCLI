@@ -86,6 +86,7 @@ export function buildRuntimeConfig(argv, cwd, storedConfig = {}) {
     resolveApiKey(providerId, storedConfig, args) ??
     (provider.requiresApiKey ? "" : String(storedConfig.apiKey ?? ""));
   const model = String(args.model ?? process.env.CAYA_MODEL ?? storedConfig.model ?? provider.defaultModel ?? "");
+  const keepAlive = String(args["keep-alive"] ?? process.env.CAYA_KEEP_ALIVE ?? storedConfig.keepAlive ?? "24h");
 
   return {
     cwd,
@@ -99,6 +100,7 @@ export function buildRuntimeConfig(argv, cwd, storedConfig = {}) {
     model,
     baseUrl,
     apiKey,
+    keepAlive,
     maxSteps: toPositiveInteger(args["max-steps"], reasoning.maxSteps),
     sessionId,
     sessionDir: path.join(cwd, ".cayadev", "sessions", sessionId)
@@ -113,7 +115,8 @@ export function createStoredConfigFromState(state) {
     reasoningName: state.reasoningName,
     model: state.model,
     baseUrl: state.baseUrl,
-    apiKey: state.apiKey
+    apiKey: state.apiKey,
+    keepAlive: state.keepAlive
   };
 }
 
