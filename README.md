@@ -4,6 +4,10 @@ CaYaDev CLI is a lightweight open-source AI coding terminal tool built to be sim
 
 The interface is fully English. The product identity follows the CaYaDev visual direction: dark terminal background, sharp red and white accents, and a direct command-line workflow.
 
+## Preview
+
+![CaYaDevCLI](./CaYaDevCLI.png)
+
 ## Features
 
 - Four runtime modes: `advanced`, `medium`, `normal`, and `low`
