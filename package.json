@@ -1,6 +1,6 @@
 {
   "name": "cayadev-cli",
-  "version": "0.1.0",
+  "version": "1.2.0",
   "description": "A simple open-source AI coding CLI with mode-based tool access and per-message checkpoints.",
   "type": "module",
   "bin": {
