@@ -128,6 +128,17 @@ function extractLooseToolPayload(content) {
     if (payload) {
       return payload;
     }
+
+    // When JSON.parse fails (e.g. trailing <<<FILE_CONTENT after }}), try balanced extraction
+    const balanced = extractBalancedObject(candidate, 0);
+
+    if (balanced) {
+      const balancedPayload = parseToolPayload(balanced);
+
+      if (balancedPayload) {
+        return balancedPayload;
+      }
+    }
   }
 
   return null;
@@ -338,9 +349,42 @@ function extractBalancedObject(text, startIndex) {
 }
 
 function extractNamedBlock(content, blockName) {
-  const pattern = new RegExp(`<<<${blockName}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n${blockName}`, "i");
-  const match = content.match(pattern);
-  return match ? match[1] : null;
+  // Try exact closing marker first  (e.g. <<<FILE_CONTENT ... FILE_CONTENT)
+  const exactPattern = new RegExp(`<<<${blockName}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n${blockName}`, "i");
+  const exactMatch = content.match(exactPattern);
+
+  if (exactMatch) {
+    return exactMatch[1];
+  }
+
+  // Accept common alternate closing markers that weaker models produce
+  const altClosers = ["FILE_END", "END_FILE_CONTENT", "CONTENT_END", "END_FILE", "END_CONTENT", "EOF"];
+
+  for (const closer of altClosers) {
+    if (closer.toLowerCase() === blockName.toLowerCase()) {
+      continue;
+    }
+
+    const altPattern = new RegExp(`<<<${blockName}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n${closer}`, "i");
+    const altMatch = content.match(altPattern);
+
+    if (altMatch) {
+      return altMatch[1];
+    }
+  }
+
+  // Try without requiring a newline before the closing marker (single-line block or missing final newline)
+  const loosePattern = new RegExp(`<<<${blockName}\\s*\\r?\\n([\\s\\S]+?)\\s*$`, "i");
+  const looseMatch = content.match(loosePattern);
+
+  if (looseMatch) {
+    // Strip an accidental trailing closing marker on the last line
+    const raw = looseMatch[1];
+    const stripped = raw.replace(/\r?\n(?:FILE_CONTENT|FILE_END|END_FILE_CONTENT|CONTENT_END|END_FILE|END_CONTENT|EOF)\s*$/i, "");
+    return stripped;
+  }
+
+  return null;
 }
 
 function extractOptionLabel(line) {

@@ -205,12 +205,16 @@ function buildToolSection(toolList, protocolTemplates) {
     "- For small repairs, prefer edit_file_lines or replace_in_file over write_file.",
     "- delete_file requires explicit local permission from the CLI user.",
     "Multiline content protocol:",
-    '- For write_file, create_file, or edit_file_lines with long content, you may send the tool call first and then a raw block:',
+    "- For write_file, create_file, or edit_file_lines with long content, use the FILE_CONTENT block format.",
+    "- IMPORTANT: The tool call JSON MUST be on its own line. The <<<FILE_CONTENT marker MUST start on the NEXT line.",
+    "- IMPORTANT: The closing marker MUST be exactly FILE_CONTENT on its own line. Do NOT write FILE_END, END, or any other variant.",
     `- ${protocolTemplates.label} protocol example:`,
     protocolTemplates.multilineWriteExample,
     "<<<FILE_CONTENT",
     "<full file text here>",
-    "FILE_CONTENT"
+    "FILE_CONTENT",
+    "- ALWAYS use tool calls (create_file, write_file) to create or modify files. NEVER output file content as plain text in your final answer.",
+    "- If you want to create a file, you MUST use a tool call. Showing code in your reply does NOT create a file."
   ];
 
   return lines;

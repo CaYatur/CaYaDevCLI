@@ -12,6 +12,29 @@ async function run(name, fn) {
   }
 }
 
+// Helper to create a mock streaming response body from JSON lines
+function createMockStreamBody(chunks) {
+  const lines = chunks.map((c) => JSON.stringify(c)).join("\n") + "\n";
+  const encoder = new TextEncoder();
+  const data = encoder.encode(lines);
+  let offset = 0;
+
+  return {
+    getReader() {
+      return {
+        async read() {
+          if (offset >= data.length) return { done: true, value: undefined };
+          const chunk = data.slice(offset);
+          offset = data.length;
+          return { done: false, value: chunk };
+        },
+        releaseLock() {},
+        async cancel() {}
+      };
+    }
+  };
+}
+
 await run("ollama falls back to generate when chat content is missing", async () => {
   const originalFetch = global.fetch;
   const calls = [];
@@ -20,25 +43,21 @@ await run("ollama falls back to generate when chat content is missing", async ()
     calls.push(String(url));
 
     if (String(url).endsWith("/api/chat")) {
+      // Empty streaming response (done immediately, no content)
       return {
         ok: true,
-        async json() {
-          return {
-            message: {
-              role: "assistant"
-            }
-          };
-        }
+        body: createMockStreamBody([
+          { message: { role: "assistant", content: "" }, done: true }
+        ])
       };
     }
 
+    // Fallback generate endpoint
     return {
       ok: true,
-      async json() {
-        return {
-          response: "Hello from generate fallback."
-        };
-      }
+      body: createMockStreamBody([
+        { response: "Hello from generate fallback.", done: true }
+      ])
     };
   };
 
@@ -70,14 +89,9 @@ await run("ollama uses chat response directly when content exists", async () => 
     callCount += 1;
     return {
       ok: true,
-      async json() {
-        return {
-          message: {
-            role: "assistant",
-            content: "Hello from chat."
-          }
-        };
-      }
+      body: createMockStreamBody([
+        { message: { role: "assistant", content: "Hello from chat." }, done: true }
+      ])
     };
   };
 

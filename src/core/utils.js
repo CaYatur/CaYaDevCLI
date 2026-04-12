@@ -8,7 +8,16 @@ const IGNORED_NAMES = new Set([
   ".git",
   "node_modules",
   "dist",
+  "dist-exe",
   "coverage"
+]);
+
+const IGNORED_EXTENSIONS = new Set([
+  ".exe",
+  ".msi",
+  ".dmg",
+  ".AppImage",
+  ".snap"
 ]);
 
 export async function ensureDir(target) {
@@ -60,6 +69,14 @@ async function copyDirectory(sourceDir, targetDir, rootDir) {
   for (const entry of entries) {
     if (IGNORED_NAMES.has(entry.name)) {
       continue;
+    }
+
+    // Skip files with ignored extensions (e.g. .exe)
+    if (!entry.isDirectory()) {
+      const ext = path.extname(entry.name);
+      if (ext && IGNORED_EXTENSIONS.has(ext)) {
+        continue;
+      }
     }
 
     const sourcePath = path.join(sourceDir, entry.name);

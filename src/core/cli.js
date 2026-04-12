@@ -15,9 +15,37 @@ import {
   saveAppConfig
 } from "./config.js";
 import { getModeConfig, listAllowedTools, MODE_NAMES } from "./modes.js";
+import {
+  getAgentConfig,
+  getAgentSystemPromptExtension,
+  isAgentId,
+  listAgents,
+  resolveAgentMaxSteps,
+  resolveAgentTemperature,
+  resolveAgentTools,
+  AGENT_IDS
+} from "./agents.js";
+import {
+  getModelInfoSummary,
+  getModelPreset,
+  getModelRecommendedTimeout,
+  getRecommendedMode,
+  getRecommendedThinking,
+  isDeepThinkingModel,
+  listModelPresetsForProvider
+} from "./models.js";
 import { extractClarificationPrompt, parseAssistantEnvelope } from "./parser.js";
 import { buildSystemPrompt } from "./prompts.js";
-import { listAvailableModels, generateAssistantMessage, shutdownProviderModels } from "./provider.js";
+import {
+  listAvailableModels,
+  generateAssistantMessage,
+  shutdownProviderModels,
+  ProviderError,
+  NetworkError,
+  TimeoutError,
+  ServerError,
+  RateLimitError
+} from "./provider.js";
 import { getProviderDefinition, isProviderId, listProviders } from "./providers.js";
 import { getReasoningConfig, isReasoningName, REASONING_NAMES } from "./reasoning.js";
 import {
@@ -38,14 +66,21 @@ import { executeTool, getToolDefinitions } from "./tools.js";
 import { ensureDir, pathExists } from "./utils.js";
 import { captureWorkspaceState, restoreWorkspaceFromSnapshot, summarizeWorkspaceChanges } from "./workspace.js";
 
+// Default timeout configuration (can be overridden via state)
+const DEFAULT_REQUEST_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const EXTENDED_REQUEST_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes for thinking models
+
 const COMMANDS = [
   "/help",
   "/mode",
+  "/agent",
   "/provider",
   "/provider current",
   "/model",
+  "/model info",
   "/thinking",
   "/keep-alive",
+  "/timeout",
   "/settings",
   "/checkpoint",
   "/checkpoints",
@@ -82,6 +117,8 @@ export async function startCli() {
     history: sessionState.history,
     composerRecallHistory: [],
     checkpointIndex: sessionState.checkpointIndex,
+    agentId: config.agentId || "coder",
+    agent: getAgentConfig(config.agentId || "coder"),
     readline: null,
     activeInputCleanup: null,
     activeTurnController: null,
@@ -224,7 +261,8 @@ async function handleTurn(userMessage, state, rl) {
   const messages = [
     {
       role: "system",
-      content: buildSystemPrompt(state.mode, state.cwd, state.reasoning, responseProtocol)
+      content: buildSystemPrompt(state.mode, state.cwd, state.reasoning, responseProtocol) +
+        getAgentSystemPromptExtension(state.agent)
     },
     ...normalizeHistoryForProtocol(state.history, responseProtocol),
     ...(activeTaskContext
@@ -256,8 +294,20 @@ async function handleTurn(userMessage, state, rl) {
         break;
       }
 
-      const spinner = startSpinner("thinking");
+      let spinner = startSpinner("thinking");
       let raw = "";
+
+      // Track token speed for the spinner display
+      let tokenCount = 0;
+      let firstTokenAt = 0;
+
+      // Calculate appropriate timeout based on thinking level, model preset, and user config
+      const isHighThinking = ["high", "extra_high"].includes(state.reasoningName);
+      const modelTimeout = getModelRecommendedTimeout(state.model);
+      const baseTimeout = state.requestTimeoutMs || modelTimeout || DEFAULT_REQUEST_TIMEOUT_MS;
+      const requestTimeout = isHighThinking ? Math.max(baseTimeout, EXTENDED_REQUEST_TIMEOUT_MS) : baseTimeout;
+      const effectiveTemperature = resolveAgentTemperature(state.mode.temperature, state.agent);
+      const isOllama = state.providerProtocol === "ollama";
 
       try {
         state.activeTurnController = new AbortController();
@@ -267,14 +317,76 @@ async function handleTurn(userMessage, state, rl) {
           baseUrl: state.baseUrl,
           model: state.model,
           messages,
-          temperature: state.mode.temperature,
+          temperature: effectiveTemperature,
           keepAlive: state.keepAlive,
-          signal: state.activeTurnController.signal
+          signal: state.activeTurnController.signal,
+          timeoutMs: requestTimeout,
+          maxRetries: isOllama ? 10 : 3,
+          onRetry: ({ attempt, maxRetries, delayMs, error, isOllama: ollamaRetry }) => {
+            spinner.stop();
+            const errorType = error.name || "Error";
+            const delaySeconds = Math.round(delayMs / 1000);
+            if (ollamaRetry) {
+              console.log(renderInfoLine("retry", `${errorType} - Reconnecting ${attempt}/${maxRetries} (waiting ${delaySeconds}s)`, "yellow"));
+            } else {
+              console.log(renderInfoLine("retry", `${errorType} - Attempt ${attempt}/${maxRetries} (waiting ${delaySeconds}s)`, "yellow"));
+            }
+            // Re-create spinner after retry message
+            tokenCount = 0;
+            firstTokenAt = 0;
+            spinner = startSpinner("thinking");
+          },
+          onToken: (chunk) => {
+            tokenCount += 1;
+            if (!firstTokenAt) {
+              firstTokenAt = Date.now();
+            }
+            spinner.updateTokens(tokenCount, firstTokenAt);
+          }
         });
       } catch (error) {
         if (isAbortError(error) || state.turnInterrupted) {
           interrupted = true;
           break;
+        }
+
+        // Enhanced error handling with specific messages
+        if (error instanceof TimeoutError) {
+          spinner.stop();
+          const timeoutMinutes = Math.round(error.timeoutMs / 60000);
+          console.log(renderInfoLine("timeout", `Request timed out after ${timeoutMinutes} minutes`, "red"));
+          console.log(renderInfoLine("hint", "Try /keep-alive 48h or use a faster model", "gray"));
+          throw error;
+        }
+
+        if (error instanceof NetworkError) {
+          spinner.stop();
+          
+          // If we have partial content from streaming, use it instead of throwing
+          if (error.partialContent && error.partialContent.trim()) {
+            console.log(renderInfoLine("network", "Connection lost during streaming, using partial response", "yellow"));
+            raw = error.partialContent;
+            break; // Exit retry loop, continue with partial content
+          }
+          
+          console.log(renderInfoLine("network", error.message, "red"));
+          console.log(renderInfoLine("hint", "Check your internet connection and provider availability", "gray"));
+          throw error;
+        }
+
+        if (error instanceof RateLimitError) {
+          spinner.stop();
+          console.log(renderInfoLine("rate-limit", error.message, "red"));
+          if (error.retryAfter) {
+            console.log(renderInfoLine("hint", `Wait ${Math.round(error.retryAfter / 1000)} seconds before retrying`, "gray"));
+          }
+          throw error;
+        }
+
+        if (error instanceof ServerError) {
+          spinner.stop();
+          console.log(renderInfoLine("server", `Server error (${error.statusCode}): ${error.message}`, "red"));
+          throw error;
         }
 
         throw error;
@@ -495,7 +607,9 @@ async function handleTurn(userMessage, state, rl) {
     }
   } catch (error) {
     if (!interrupted) {
-      console.log(renderInfoLine("provider", error instanceof Error ? error.message : String(error), "red"));
+      // Format error message based on error type
+      const errorMessage = formatProviderError(error);
+      console.log(renderInfoLine("provider", errorMessage, "red"));
     }
     return;
   } finally {
@@ -576,6 +690,9 @@ async function handleCommand(inputText, state, rl) {
     case "mode":
       await handleModeCommand(rest, state);
       return false;
+    case "agent":
+      await handleAgentCommand(rest, state);
+      return false;
     case "model":
       await handleModelCommand(rest, state, rl);
       return false;
@@ -586,6 +703,9 @@ async function handleCommand(inputText, state, rl) {
     case "keep-alive":
     case "keepalive":
       await handleKeepAliveCommand(rest, state);
+      return false;
+    case "timeout":
+      await handleTimeoutCommand(rest, state);
       return false;
     case "settings":
       await openSettingsMenu(state, rl);
@@ -627,12 +747,15 @@ async function handleCommand(inputText, state, rl) {
         JSON.stringify(
           {
             mode: state.modeName,
+            agent: state.agentId,
             provider: state.providerId,
             thinking: state.reasoningName,
             protocol: state.providerProtocol,
             model: state.model,
+            modelInfo: getModelInfoSummary(state.model) || "(unknown model)",
             baseUrl: state.baseUrl,
             keepAlive: state.keepAlive || "24h",
+            timeout: `${Math.round(state.requestTimeoutMs / 60000)}m`,
             sessionId: state.sessionId,
             sessionDir: state.sessionDir,
             maxSteps: state.maxSteps
@@ -671,9 +794,73 @@ async function handleModeCommand(args, state) {
   console.log(renderInfoLine("mode", `changed to ${state.mode.label}`, "green"));
 }
 
+async function handleAgentCommand(args, state) {
+  const nextAgent = String(args[0] ?? "").toLowerCase();
+
+  if (!nextAgent) {
+    console.log(renderInfoLine("agent", `${state.agent.icon} ${state.agent.label} — ${state.agent.description}`));
+    console.log(renderInfoLine("available", AGENT_IDS.join(", "), "gray"));
+
+    const agents = listAgents();
+    for (const agent of agents) {
+      const marker = agent.id === state.agentId ? " *" : "  ";
+      console.log(`${marker}${agent.icon} ${agent.label}: ${agent.description}`);
+    }
+    return;
+  }
+
+  if (!isAgentId(nextAgent)) {
+    console.log(renderInfoLine("error", `Invalid agent. Available: ${AGENT_IDS.join(", ")}`, "red"));
+    return;
+  }
+
+  const agentConfig = getAgentConfig(nextAgent);
+
+  // Check if agent supports current mode
+  if (!agentConfig.supportedModes.includes(state.modeName)) {
+    console.log(renderInfoLine("warning", `Agent "${agentConfig.label}" works best with: ${agentConfig.supportedModes.join(", ")}`, "yellow"));
+  }
+
+  state.agentId = nextAgent;
+  state.agent = agentConfig;
+  state.maxSteps = resolveAgentMaxSteps(state.reasoning.maxSteps, agentConfig);
+  await persistAppConfig(state);
+  console.log(renderInfoLine("agent", `changed to ${agentConfig.icon} ${agentConfig.label}`, "green"));
+}
+
 async function handleModelCommand(args, state, rl) {
+  // Handle /model info subcommand
+  if (args[0] === "info") {
+    const targetModel = args.slice(1).join(" ") || state.model;
+    const info = getModelInfoSummary(targetModel);
+    if (info) {
+      console.log(renderInfoLine("model", targetModel));
+      console.log(renderInfoLine("info", info, "cyan"));
+      const recMode = getRecommendedMode(targetModel);
+      const recThinking = getRecommendedThinking(targetModel);
+      console.log(renderInfoLine("recommended", `mode: ${recMode}, thinking: ${recThinking}`, "gray"));
+    } else {
+      console.log(renderInfoLine("model", `${targetModel} (no preset info available)`, "yellow"));
+    }
+    return;
+  }
+
   if (args[0]) {
     state.model = args.join(" ");
+
+    // Auto-apply model-aware timeout if user hasn't set a custom one
+    const modelTimeout = getModelRecommendedTimeout(state.model);
+    if (modelTimeout && state.requestTimeoutMs === 10 * 60 * 1000) {
+      state.requestTimeoutMs = modelTimeout;
+      console.log(renderInfoLine("timeout", `auto-set to ${Math.round(modelTimeout / 60000)}m for ${state.model}`, "gray"));
+    }
+
+    // Show recommendation hints
+    const info = getModelInfoSummary(state.model);
+    if (info) {
+      console.log(renderInfoLine("info", info, "gray"));
+    }
+
     await persistAppConfig(state);
     console.log(renderInfoLine("model", `changed to ${state.model}`, "green"));
     return;
@@ -687,6 +874,14 @@ async function handleModelCommand(args, state, rl) {
   }
 
   state.model = selectedModel;
+
+  // Auto-apply model-aware timeout
+  const modelTimeout = getModelRecommendedTimeout(state.model);
+  if (modelTimeout && state.requestTimeoutMs === 10 * 60 * 1000) {
+    state.requestTimeoutMs = modelTimeout;
+    console.log(renderInfoLine("timeout", `auto-set to ${Math.round(modelTimeout / 60000)}m for ${state.model}`, "gray"));
+  }
+
   await persistAppConfig(state);
   console.log(renderInfoLine("model", `changed to ${state.model}`, "green"));
 }
@@ -725,6 +920,38 @@ async function handleKeepAliveCommand(args, state) {
   state.keepAlive = nextKeepAlive;
   await persistAppConfig(state);
   console.log(renderInfoLine("keep-alive", `changed to ${nextKeepAlive}`, "green"));
+}
+
+async function handleTimeoutCommand(args, state) {
+  const input = String(args[0] ?? "").trim().toLowerCase();
+
+  if (!input) {
+    const currentMinutes = Math.round(state.requestTimeoutMs / 60000);
+    console.log(renderInfoLine("timeout", `${currentMinutes} minutes`, "cyan"));
+    console.log(renderInfoLine("examples", "5m, 10m, 15m, 30m, 60m", "gray"));
+    console.log(renderInfoLine("note", "Maximum time to wait for model response before retry", "gray"));
+    return;
+  }
+
+  // Parse timeout value (supports: 5m, 10, 30m, etc.)
+  let timeoutMs;
+  const match = input.match(/^(\d+)(m|min|minutes?)?$/);
+
+  if (!match) {
+    console.log(renderInfoLine("error", "Invalid format. Use: 5m, 10m, 30m, or just a number (minutes)", "red"));
+    return;
+  }
+
+  const minutes = parseInt(match[1], 10);
+  if (minutes < 1 || minutes > 120) {
+    console.log(renderInfoLine("error", "Timeout must be between 1 and 120 minutes", "red"));
+    return;
+  }
+
+  timeoutMs = minutes * 60 * 1000;
+  state.requestTimeoutMs = timeoutMs;
+  await persistAppConfig(state);
+  console.log(renderInfoLine("timeout", `changed to ${minutes} minutes`, "green"));
 }
 
 async function handleSessionCommand(args, state, _rl) {
@@ -968,11 +1195,13 @@ async function printCheckpoints(state) {
 
 function printTools(state) {
   const definitions = getToolDefinitions(state.mode);
-  const names = listAllowedTools(state.mode);
+  const modeTools = listAllowedTools(state.mode);
+  const names = resolveAgentTools(modeTools, state.agent);
 
   console.log(renderSectionTitle("Tools"));
+  console.log(renderInfoLine("agent", `${state.agent.icon} ${state.agent.label}`, "cyan"));
   console.log(renderInfoLine("allowed", names.join(", "), "gray"));
-  definitions.forEach((tool) => {
+  definitions.filter((t) => names.includes(t.name)).forEach((tool) => {
     console.log(`- ${tool.name}: ${tool.description}`);
   });
 }
@@ -983,19 +1212,31 @@ function printHelp() {
   console.log(renderSectionTitle("Commands"));
   console.log("Enter               Send the composed message");
   console.log(`New line            ${preferredNewlineShortcut}`);
-  console.log("Ctrl+L              Add a new line fallback (works in all terminals)");
-  console.log("Windows tip         If Shift+Enter fails, map it to ESC[13;2u in terminal settings");
+  console.log("Ctrl+J              Add a new line (works in all terminals)");
+  console.log("Ctrl+Enter          Add a new line (most terminals)");
+  if (process.platform !== "win32") {
+    console.log("Shift+Enter         Add a new line");
+  } else {
+    console.log("Alt+Enter           Add a new line (Windows PowerShell)");
+    console.log("Shift+Enter         Add a new line (Windows Terminal/VS Code)");
+  }
   console.log("/help               Show this help");
   console.log("/mode               Show current mode");
   console.log("/mode <name>        Switch to advanced, medium, normal, or low");
+  console.log("/agent              Show current agent and list available agents");
+  console.log("/agent <name>       Switch agent (coder, architect, reviewer, debugger, writer, researcher, refactor)");
   console.log("/provider           Open the provider setup wizard");
   console.log("/provider current   Show the current provider");
   console.log("/model              Open the model selector for the current provider");
   console.log("/model <name>       Switch model directly");
+  console.log("/model info         Show current model capabilities and recommendations");
+  console.log("/model info <name>  Show capabilities for a specific model");
   console.log("/thinking           Show current thinking level");
   console.log("/thinking <level>   Set low, medium, high, or extra_high");
   console.log("/keep-alive         Show current model keep-alive duration");
   console.log("/keep-alive <time>  Set keep-alive (e.g., 10m, 1h, 24h, 48h)");
+  console.log("/timeout            Show current request timeout");
+  console.log("/timeout <time>     Set request timeout (e.g., 10m, 30m, 60m)");
   console.log("/settings           Open the runtime settings menu");
   console.log("/checkpoint         Open checkpoint restore menu");
   console.log("/checkpoint <id>    Restore a specific checkpoint");
@@ -1280,6 +1521,20 @@ async function openSettingsMenu(state, rl) {
       }
     },
     {
+      label: `Agent: ${state.agent.icon} ${state.agent.label}`,
+      description: "Switch between specialized agent personas.",
+      action: async () => {
+        const selected = await chooseAgentFromMenu(state);
+
+        if (!selected) {
+          console.log(renderInfoLine("agent", "unchanged", "gray"));
+          return;
+        }
+
+        await handleAgentCommand([selected.id], state);
+      }
+    },
+    {
       label: `Thinking: ${state.reasoning.label}`,
       description: "Change the reasoning depth for future turns.",
       action: async () => {
@@ -1307,6 +1562,11 @@ async function openSettingsMenu(state, rl) {
       label: `Keep-alive: ${state.keepAlive}`,
       description: "Set model keep-alive duration (prevents timeout on slow responses).",
       action: async () => await handleKeepAliveCommand([], state)
+    },
+    {
+      label: `Timeout: ${Math.round(state.requestTimeoutMs / 60000)}m`,
+      description: "Set request timeout (auto-adjusted per model).",
+      action: async () => await handleTimeoutCommand([], state)
     },
     {
       label: "Show config",
@@ -1350,6 +1610,17 @@ async function chooseThinkingFromMenu(state) {
   });
 
   return chooseFromMenu("Select Thinking", items, state);
+}
+
+async function chooseAgentFromMenu(state) {
+  const agents = listAgents();
+  const items = agents.map((agent) => ({
+    id: agent.id,
+    label: `${agent.icon} ${agent.label}`,
+    description: agent.description
+  }));
+
+  return chooseFromMenu("Select Agent", items, state);
 }
 
 async function chooseCheckpointFromMenu(manifests, state) {
@@ -1468,6 +1739,7 @@ function printHome(state) {
   const preferredNewlineShortcut = getPreferredNewlineShortcutLabel();
 
   console.log(renderBanner(state.mode, state.model, state.providerLabel, state.reasoning.label));
+  console.log(renderInfoLine("agent", `${state.agent.icon} ${state.agent.label}`, "cyan"));
   console.log(
     renderInfoLine(
       "hint",
@@ -1483,11 +1755,13 @@ function getPreferredNewlineShortcutLabel() {
     return "Shift+Enter adds a new line";
   }
 
+  // Windows Terminal and VS Code terminal support CSI-u, so Shift+Enter works there
   if (process.env.TERM_PROGRAM === "vscode" || process.env.WT_SESSION) {
-    return "Shift+Enter adds a new line (fallback: Ctrl+L)";
+    return "Shift+Enter or Ctrl+J adds a new line";
   }
 
-  return "Ctrl+L adds a new line (Shift+Enter terminal-dependent)";
+  // Standard Windows terminals: Alt+Enter, Ctrl+J, or ESC+Enter for new line
+  return "Alt+Enter, Ctrl+J, or Shift+Enter (ESC then Enter) adds a new line";
 }
 
 function truncate(value, maxLength) {
@@ -1499,20 +1773,29 @@ function startSpinner(label) {
   const frames = ["|", "/", "-", "\\"];
   const startedAt = Date.now();
   let frameIndex = 0;
+  let tokenInfo = "";
   output.write(`${label} ${frames[0]} 0.0s`);
 
   const timer = setInterval(() => {
     const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
     frameIndex = (frameIndex + 1) % frames.length;
-    output.write(`\r${label} ${frames[frameIndex]} ${seconds}s`);
+    const line = `\r${label} ${frames[frameIndex]} ${seconds}s${tokenInfo}`;
+    output.write(line + " ".repeat(Math.max(0, 50 - line.length)));
   }, 120);
 
   return {
     startedAt,
+    updateTokens(count, firstTokenAt) {
+      if (count > 0 && firstTokenAt > 0) {
+        const elapsed = (Date.now() - firstTokenAt) / 1000;
+        const tokSec = elapsed > 0 ? (count / elapsed).toFixed(1) : "0.0";
+        tokenInfo = ` | ${count} tokens (${tokSec} tok/s)`;
+      }
+    },
     stop() {
       clearInterval(timer);
       output.write("\r");
-      output.write(" ".repeat(32));
+      output.write(" ".repeat(60));
       output.write("\r");
     }
   };
@@ -1570,6 +1853,33 @@ function handleSigint(state) {
 
 function isAbortError(error) {
   return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
+}
+
+// Format provider errors with user-friendly messages and suggestions
+function formatProviderError(error) {
+  if (error instanceof TimeoutError) {
+    const timeoutMinutes = Math.round((error.timeoutMs || 600000) / 60000);
+    return `Request timed out after ${timeoutMinutes} minutes. Try /keep-alive 48h or a faster model.`;
+  }
+
+  if (error instanceof NetworkError) {
+    return `${error.message}. Check connection and provider availability.`;
+  }
+
+  if (error instanceof RateLimitError) {
+    const retryInfo = error.retryAfter ? ` Retry after ${Math.round(error.retryAfter / 1000)}s.` : "";
+    return `Rate limit exceeded.${retryInfo}`;
+  }
+
+  if (error instanceof ServerError) {
+    return `Server error (${error.statusCode}): ${error.message.slice(0, 200)}`;
+  }
+
+  if (error instanceof ProviderError) {
+    return `${error.type}: ${error.message}`;
+  }
+
+  return error instanceof Error ? error.message : String(error);
 }
 
 function shouldForceFileContentFollowUp(userMessage, createdPath = "", bytesWritten = 0) {
@@ -2047,8 +2357,29 @@ async function promptForChatInput(state, rl) {
   let rapidInputLastAt = 0;
   let rapidInputTimer = null;
   let lastEscapeAt = 0;
+  let lastRenderAt = 0;
+  let pendingRender = null;
 
   const render = () => {
+    const now = Date.now();
+    const MIN_RENDER_INTERVAL = 16; // ~60fps max
+    
+    // Throttle renders to prevent terminal flooding
+    if (now - lastRenderAt < MIN_RENDER_INTERVAL) {
+      if (!pendingRender) {
+        pendingRender = setTimeout(() => {
+          pendingRender = null;
+          doRender();
+        }, MIN_RENDER_INTERVAL - (now - lastRenderAt));
+      }
+      return;
+    }
+    
+    doRender();
+  };
+  
+  const doRender = () => {
+    lastRenderAt = Date.now();
     clearRenderedComposer(renderedLineCount);
     const block = renderChatComposer(state.modeName, typedText, pastedText, commandSuggestions);
     output.write(block);
@@ -2126,11 +2457,24 @@ async function promptForChatInput(state, rl) {
     let cleanedUp = false;
 
     const onKeypress = (str, key) => {
-      if (!key) {
+      const sequence = typeof str === "string" ? str : String(key?.sequence ?? "");
+
+      // Detect CSI-u Shift+Enter sequences before the !key guard.
+      // Node.js readline may not parse CSI-u escape sequences into a key object,
+      // so we check the raw sequence first to avoid dropping Shift+Enter events.
+      if (isShiftEnterEscapeSequence(sequence)) {
+        flushRapidInput({ forceTyped: true });
+        leaveHistoryNavigation();
+        typedText = typedText.slice(0, cursorIndex) + "\n" + typedText.slice(cursorIndex);
+        cursorIndex += 1;
+        commandSuggestions = [];
+        render();
         return;
       }
 
-      const sequence = typeof str === "string" ? str : String(key.sequence ?? "");
+      if (!key) {
+        return;
+      }
 
       if (key.name === "escape" && sequence === "\u001b") {
         lastEscapeAt = Date.now();
@@ -2173,16 +2517,10 @@ async function promptForChatInput(state, rl) {
         return;
       }
 
-      if (key.name === "linefeed") {
+      // Ctrl+J and Ctrl+Enter both produce \n (0x0A).
+      // Node.js 20+ maps \n to key.name='enter' (not 'linefeed'), so check both.
+      if (key.name === "linefeed" || (key.name === "enter" && sequence === "\n")) {
         flushRapidInput({ forceTyped: true });
-
-        // Only consume silently if it's Ctrl+J (Ctrl+Linefeed) but not with Shift
-        if ((key.ctrl && !key.shift) || (key.meta && !key.shift)) {
-          commandSuggestions = [];
-          render();
-          return;
-        }
-
         leaveHistoryNavigation();
         typedText = typedText.slice(0, cursorIndex) + "\n" + typedText.slice(cursorIndex);
         cursorIndex += 1;
@@ -2201,16 +2539,7 @@ async function promptForChatInput(state, rl) {
         return;
       }
 
-      // Ctrl+L for newline (Windows PowerShell workaround for Shift+Enter)
-      if (key.ctrl && key.name === "l") {
-        flushRapidInput({ forceTyped: true });
-        leaveHistoryNavigation();
-        typedText = typedText.slice(0, cursorIndex) + "\n" + typedText.slice(cursorIndex);
-        cursorIndex += 1;
-        commandSuggestions = [];
-        render();
-        return;
-      }
+
 
       if (isComposerSendShortcut(key, sequence, lastEscapeAt)) {
         const now = Date.now();
@@ -2398,6 +2727,12 @@ async function promptForChatInput(state, rl) {
         state.activeInputCleanup = null;
       }
 
+      // Clear any pending throttled render
+      if (pendingRender) {
+        clearTimeout(pendingRender);
+        pendingRender = null;
+      }
+
       if (enhancedInputEnabled) {
         disableTerminalInputEnhancements();
         enhancedInputEnabled = false;
@@ -2582,17 +2917,27 @@ function shouldTreatBufferedInputAsPaste(text, eventCount) {
 }
 
 function isComposerIgnoredShortcut(key, sequence) {
-  if (key?.ctrl && (key.name === "s" || key.name === "j" || key.name === "linefeed")) {
+  if (key?.ctrl && key.name === "s") {
     return true;
   }
 
-  const value = String(sequence ?? "");
-
-  return process.platform === "win32" && key?.ctrl && value === "\n";
+  return false;
 }
 
 function isComposerNewLineShortcut(key, sequence, lastEscapeAt = 0) {
-  if ((key?.name === "return" || key?.name === "enter") && (key.shift || key.meta)) {
+  const name = key?.name;
+  const isReturnLike = name === "return" || name === "enter";
+
+  if (isReturnLike && (key.shift || key.meta)) {
+    return true;
+  }
+
+  if (isReturnLike && key.ctrl) {
+    return true;
+  }
+
+  // Windows PowerShell: Alt+Enter as fallback for Shift+Enter (CSI-u not supported)
+  if (isReturnLike && key.alt) {
     return true;
   }
 
@@ -2602,7 +2947,8 @@ function isComposerNewLineShortcut(key, sequence, lastEscapeAt = 0) {
     return true;
   }
 
-  if ((key?.name === "return" || key?.name === "enter") && Date.now() - Number(lastEscapeAt ?? 0) <= 120) {
+  // ESC then Enter within 120ms — treat as Alt+Enter / meta+Enter
+  if (isReturnLike && Date.now() - Number(lastEscapeAt ?? 0) <= 120) {
     return true;
   }
 
@@ -2610,7 +2956,8 @@ function isComposerNewLineShortcut(key, sequence, lastEscapeAt = 0) {
 }
 
 function isComposerSendShortcut(key, sequence, lastEscapeAt = 0) {
-  if (key?.name !== "return" && key?.name !== "enter") {
+  const name = key?.name;
+  if (name !== "return" && name !== "enter") {
     return false;
   }
 
@@ -2628,11 +2975,13 @@ function isComposerSendShortcut(key, sequence, lastEscapeAt = 0) {
     return false;
   }
 
-  if (process.platform === "win32" && value === "\n") {
+  // \n (0x0A) is produced by Ctrl+J and Ctrl+Enter — never treat as send
+  if (value === "\n") {
     return false;
   }
 
-  return value === "" || value === "\r" || value === "\n";
+  // Only \r (0x0D, from the Enter key) sends
+  return value === "" || value === "\r";
 }
 
 function isShiftEnterEscapeSequence(sequence) {

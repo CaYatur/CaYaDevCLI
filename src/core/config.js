@@ -87,11 +87,18 @@ export function buildRuntimeConfig(argv, cwd, storedConfig = {}) {
     (provider.requiresApiKey ? "" : String(storedConfig.apiKey ?? ""));
   const model = String(args.model ?? process.env.CAYA_MODEL ?? storedConfig.model ?? provider.defaultModel ?? "");
   const keepAlive = String(args["keep-alive"] ?? process.env.CAYA_KEEP_ALIVE ?? storedConfig.keepAlive ?? "24h");
+  const requestTimeoutMs = parseTimeoutValue(
+    args["timeout"] ?? process.env.CAYA_TIMEOUT ?? storedConfig.requestTimeoutMs,
+    10 * 60 * 1000 // Default 10 minutes
+  );
+
+  const agentId = String(args.agent ?? process.env.CAYA_AGENT ?? storedConfig.agentId ?? "coder");
 
   return {
     cwd,
     modeName,
     mode: getModeConfig(modeName),
+    agentId,
     providerId,
     providerLabel: provider.label,
     providerProtocol,
@@ -101,6 +108,7 @@ export function buildRuntimeConfig(argv, cwd, storedConfig = {}) {
     baseUrl,
     apiKey,
     keepAlive,
+    requestTimeoutMs,
     maxSteps: toPositiveInteger(args["max-steps"], reasoning.maxSteps),
     sessionId,
     sessionDir: path.join(cwd, ".cayadev", "sessions", sessionId)
@@ -110,13 +118,15 @@ export function buildRuntimeConfig(argv, cwd, storedConfig = {}) {
 export function createStoredConfigFromState(state) {
   return {
     modeName: state.modeName,
+    agentId: state.agentId,
     providerId: state.providerId,
     providerProtocol: state.providerProtocol,
     reasoningName: state.reasoningName,
     model: state.model,
     baseUrl: state.baseUrl,
     apiKey: state.apiKey,
-    keepAlive: state.keepAlive
+    keepAlive: state.keepAlive,
+    requestTimeoutMs: state.requestTimeoutMs
   };
 }
 
@@ -157,6 +167,27 @@ function createSessionId() {
 function toPositiveInteger(value, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseTimeoutValue(value, fallback) {
+  if (value == null || value === "") return fallback;
+  const str = String(value).trim().toLowerCase();
+
+  // Already a number in ms (from stored config)
+  const asNumber = Number(str);
+  if (Number.isFinite(asNumber) && asNumber >= 60000) return asNumber;
+
+  // Parse time units: "30m", "10min", "1h", "90s"
+  const match = str.match(/^(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hr|hours?)?$/);
+  if (!match) return fallback;
+
+  const num = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(num) || num <= 0) return fallback;
+
+  const unit = match[2] || "m"; // default to minutes
+  if (unit.startsWith("h")) return num * 60 * 60 * 1000;
+  if (unit.startsWith("s")) return Math.max(num * 1000, 30000); // min 30s
+  return num * 60 * 1000; // minutes
 }
 
 function resolveApiKey(providerId, storedConfig, args) {
